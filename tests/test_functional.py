@@ -2,7 +2,7 @@ import socket
 
 import pytest
 
-from grpclib.client import Channel
+from grpclib.client import Channel, _to_list
 from grpclib.server import Server
 
 from bombed_pb2 import SavoysRequest, SavoysReply
@@ -41,6 +41,7 @@ class Bombed(BombedBase):
 
 class ClientServer:
     server = None
+    channel = None
 
     def __init__(self, *, loop):
         self.loop = loop
@@ -56,13 +57,20 @@ class ClientServer:
         self.server = Server([bombed], loop=self.loop)
         await self.server.start(host, port)
 
-        channel = Channel(host=host, port=port, loop=self.loop)
-        stub = BombedStub(channel)
+        self.channel = Channel(host=host, port=port, loop=self.loop)
+        stub = BombedStub(self.channel)
         return bombed, stub
 
     async def __aexit__(self, *exc_info):
         self.server.close()
         await self.server.wait_closed()
+        self.channel.close()
+
+
+@pytest.mark.asyncio
+async def test_close_empty_channel(loop):
+    async with ClientServer(loop=loop):
+        """it should not raise exceptions"""
 
 
 @pytest.mark.asyncio
@@ -98,7 +106,7 @@ async def test_unary_stream_advanced(loop):
     async with ClientServer(loop=loop) as (handler, stub):
         async with stub.Benzine.open() as stream:
             await stream.send_message(SavoysRequest(kyler='eediot'), end=True)
-            replies = [r async for r in stream]
+            replies = await _to_list(stream)
         assert handler.log == [SavoysRequest(kyler='eediot')]
         assert replies == [GoowyChunk(biomes='papists'),
                            GoowyChunk(biomes='tip'),

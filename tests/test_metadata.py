@@ -33,7 +33,16 @@ def test_decode_timeout(value, expected):
 
 
 def test_deadline():
-    assert min(Deadline(1), Deadline(2)) == Deadline(1)
+    assert Deadline.from_timeout(1) < Deadline.from_timeout(2)
+
+    with pytest.raises(TypeError) as err:
+        Deadline.from_timeout(1) < 'invalid'
+    err.match('comparison is not supported between instances '
+              'of \'Deadline\' and \'str\'')
+
+    assert Deadline(_timestamp=1) == Deadline(_timestamp=1)
+
+    assert Deadline.from_timeout(1) != 'invalid'
 
 
 def test_headers_with_deadline():
@@ -43,12 +52,13 @@ def test_headers_with_deadline():
     metadata = Metadata([('dominic', 'lovech')])
 
     assert Request(
-        'briana', 'dismal', 'dost', content_type='gazebos',
+        'briana', 'dismal', 'dost', authority='lemnos', content_type='gazebos',
         metadata=metadata, deadline=deadline,
     ).to_headers() == [
         (':method', 'briana'),
         (':scheme', 'dismal'),
         (':path', 'dost'),
+        (':authority', 'lemnos'),
         ('grpc-timeout', '100m'),
         ('te', 'trailers'),
         ('content-type', 'gazebos'),
@@ -80,11 +90,13 @@ def test_headers_without_deadline():
     metadata = Metadata([('chagga', 'chrome')])
 
     assert Request(
-        'flysch', 'plains', 'slaps', content_type='pemako', metadata=metadata,
+        'flysch', 'plains', 'slaps', authority='darrin', content_type='pemako',
+        metadata=metadata,
     ).to_headers() == [
         (':method', 'flysch'),
         (':scheme', 'plains'),
         (':path', 'slaps'),
+        (':authority', 'darrin'),
         ('te', 'trailers'),
         ('content-type', 'pemako'),
         ('chagga', 'chrome'),

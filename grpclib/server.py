@@ -3,6 +3,7 @@ import logging
 import asyncio
 
 import h2.config
+import h2.exceptions
 import async_timeout
 
 from .const import Status
@@ -95,55 +96,74 @@ class Stream(StreamIterator):
             # to suppress exception propagation
             return True
 
-        if exc_type or exc_val or exc_tb:
+        if exc_val is not None:
             if isinstance(exc_val, GRPCError):
-                status, status_message = exc_val.status, exc_val.message
+                status = exc_val.status
+                status_message = exc_val.message
+            elif isinstance(exc_val, Exception):
+                status = Status.UNKNOWN
+                status_message = 'Internal Server Error'
             else:
-                status, status_message = Status.UNKNOWN, 'Internal Server Error'
+                # propagate exception
+                return
+        elif not self._send_message_count:
+            status = Status.UNKNOWN
+            status_message = 'Empty response'
+        else:
+            status = Status.OK
+            status_message = None
 
+        try:
             await self.send_trailing_metadata(status=status,
                                               status_message=status_message)
-            # to suppress exception propagation
-            return True
-        elif not self._send_message_count:
-            await self.send_trailing_metadata(status=Status.UNKNOWN,
-                                              status_message='Empty response')
-        else:
-            await self.send_trailing_metadata()
+        except h2.exceptions.StreamClosedError:
+            pass
+
+        # to suppress exception propagation
+        return True
 
 
-async def request_handler(mapping, _stream, headers):
-    headers_map = dict(headers)
-    h2_method = headers_map[':method']
-    h2_path = headers_map[':path']
-    h2_content_type = headers_map['content-type']
+async def request_handler(mapping, _stream, headers, release_stream):
+    try:
+        headers_map = dict(headers)
+        h2_method = headers_map[':method']
+        h2_path = headers_map[':path']
+        h2_content_type = headers_map['content-type']
 
-    metadata = Metadata.from_headers(headers)
-    deadline = Deadline.from_metadata(metadata)
+        metadata = Metadata.from_headers(headers)
+        deadline = Deadline.from_metadata(metadata)
 
-    method = mapping.get(h2_path)
+        method = mapping.get(h2_path)
 
-    assert h2_method == 'POST', h2_method
-    assert method is not None, h2_path
-    assert h2_content_type in CONTENT_TYPES, h2_content_type
+        assert h2_method == 'POST', h2_method
+        assert method is not None, h2_path
+        assert h2_content_type in CONTENT_TYPES, h2_content_type
 
-    async with Stream(_stream, method.cardinality,
-                      method.request_type, method.reply_type,
-                      metadata=metadata, deadline=deadline) as stream:
-        timeout = None if deadline is None else deadline.time_remaining()
-        timeout_cm = None
-        try:
-            with async_timeout.timeout(timeout) as timeout_cm:
-                await method.func(stream)
-        except asyncio.TimeoutError:
-            if timeout_cm and timeout_cm.expired:
-                raise GRPCError(Status.DEADLINE_EXCEEDED)
-            else:
-                log.exception('Server error')
+        async with Stream(_stream, method.cardinality,
+                          method.request_type, method.reply_type,
+                          metadata=metadata, deadline=deadline) as stream:
+            timeout = None if deadline is None else deadline.time_remaining()
+            timeout_cm = None
+            try:
+                with async_timeout.timeout(timeout) as timeout_cm:
+                    await method.func(stream)
+            except asyncio.TimeoutError:
+                if timeout_cm and timeout_cm.expired:
+                    log.exception('Deadline exceeded')
+                    raise GRPCError(Status.DEADLINE_EXCEEDED)
+                else:
+                    log.exception('Timeout occurred')
+                    raise
+            except asyncio.CancelledError:
+                log.exception('Request was cancelled')
                 raise
-        except Exception:
-            log.exception('Server error')
-            raise
+            except Exception:
+                log.exception('Application error')
+                raise
+    except Exception:
+        log.exception('Server error')
+    finally:
+        release_stream()
 
 
 class _GC(abc.ABC):
@@ -181,10 +201,10 @@ class Handler(_GC, AbstractHandler):
         self._cancelled = {t for t in self._cancelled
                            if not t.done()}
 
-    def accept(self, stream, headers):
+    def accept(self, stream, headers, release_stream):
         self.__gc_step__()
         self._tasks[stream] = self.loop.create_task(
-            request_handler(self.mapping, stream, headers)
+            request_handler(self.mapping, stream, headers, release_stream)
         )
 
     def cancel(self, stream):

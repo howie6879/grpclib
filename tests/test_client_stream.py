@@ -1,10 +1,10 @@
-from asyncio import Transport
-from collections import namedtuple
-
 import pytest
 import struct
+import asyncio
+import collections
 
 from h2.config import H2Configuration
+from h2.settings import SettingCodes
 from h2.connection import H2Connection
 
 from grpclib.const import Status
@@ -14,6 +14,7 @@ from grpclib.protocol import H2Protocol
 from grpclib.metadata import Request
 from grpclib.exceptions import GRPCError
 
+from stubs import TransportStub
 from bombed_pb2 import SavoysRequest, SavoysReply
 
 
@@ -24,7 +25,7 @@ def _broken_stream():
         def __connect__(self):
             raise IOError('Intentionally broken connection')
 
-    request = Request('POST', 'http', '/foo/bar', content_type=CONTENT_TYPE)
+    request = Request('POST', 'http', '/foo/bar', authority='test.com')
     return Stream(BrokenChannel(), request, SavoysRequest, SavoysReply)
 
 
@@ -32,22 +33,6 @@ def encode_message(message):
     message_bin = message.SerializeToString()
     header = struct.pack('?', False) + struct.pack('>I', len(message_bin))
     return header + message_bin
-
-
-class TransportStub(Transport):
-
-    def __init__(self, connection):
-        super().__init__()
-        self._connection = connection
-        self._events = []
-
-    def events(self):
-        events = self._events[:]
-        del self._events[:]
-        return events
-
-    def write(self, data):
-        self._events.extend(self._connection.receive_data(data))
 
 
 class ServerStub:
@@ -76,7 +61,7 @@ class ChannelStub:
         return self.__protocol__
 
 
-Stub = namedtuple('Stub', 'stream, server, channel')
+Stub = collections.namedtuple('Stub', 'stream, server, channel')
 
 
 @pytest.fixture(name='stub')
@@ -85,8 +70,7 @@ def _stub(loop):
                           H2Configuration(header_encoding='utf-8'),
                           loop=loop)
     channel = ChannelStub(protocol)
-    request = Request('POST', 'http', '/foo/bar', content_type=CONTENT_TYPE,
-                      authority='test.com')
+    request = Request('POST', 'http', '/foo/bar', authority='test.com')
     stream = Stream(channel, request, SavoysRequest, SavoysReply)
     server = ServerStub(protocol)
     return Stub(stream, server, channel)
@@ -177,3 +161,53 @@ async def test_ctx_exit_with_error_and_closed_stream(stub):
             stub.server.connection.reset_stream(events[-1].stream_id)
             stub.server.flush()
             raise ClientError()
+
+
+@pytest.mark.asyncio
+async def test_outbound_streams_limit(stub, loop):
+    stub.server.connection.update_settings({
+        SettingCodes.MAX_CONCURRENT_STREAMS: 1,
+    })
+    stub.server.flush()
+
+    request = Request('POST', 'http', '/foo/bar', authority='test.com')
+
+    async def worker1():
+        s1 = Stream(stub.channel, request, SavoysRequest, SavoysReply)
+        async with s1:
+            await s1.send_message(SavoysRequest(kyler='bhatta'), end=True)
+            assert await s1.recv_message() == SavoysReply(benito='giselle')
+
+    async def worker2():
+        s2 = Stream(stub.channel, request, SavoysRequest, SavoysReply)
+        async with s2:
+            await s2.send_message(SavoysRequest(kyler='bhatta'), end=True)
+            assert await s2.recv_message() == SavoysReply(benito='giselle')
+
+    def send_response(stream_id):
+        stub.server.connection.send_headers(
+            stream_id,
+            [(':status', '200'), ('content-type', CONTENT_TYPE)],
+        )
+        stub.server.connection.send_data(
+            stream_id,
+            encode_message(SavoysReply(benito='giselle')),
+        )
+        stub.server.connection.send_headers(
+            stream_id,
+            [('grpc-status', str(Status.OK.value))],
+            end_stream=True,
+        )
+        stub.server.flush()
+
+    w1 = loop.create_task(worker1())
+    w2 = loop.create_task(worker2())
+
+    done, pending = await asyncio.wait([w1, w2], loop=loop, timeout=0.001)
+    assert not done and pending == {w1, w2}
+
+    send_response(1)
+    await asyncio.wait_for(w1, 0.1, loop=loop)
+
+    send_response(3)
+    await asyncio.wait_for(w2, 0.1, loop=loop)

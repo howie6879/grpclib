@@ -13,10 +13,17 @@ from .metadata import Metadata, Request, Deadline
 from .exceptions import GRPCError, ProtocolError
 
 
+async def _to_list(stream):
+    result = []
+    async for message in stream:
+        result.append(message)
+    return result
+
+
 class Handler(AbstractHandler):
     connection_lost = False
 
-    def accept(self, stream, headers):
+    def accept(self, stream, headers, release_stream):
         raise NotImplementedError('Client connection can not accept requests')
 
     def cancel(self, stream):
@@ -36,6 +43,9 @@ class Stream(StreamIterator):
     _recv_trailing_metadata_done = False
     _cancel_done = False
 
+    _stream = None
+    _release_stream = None
+
     initial_metadata = None
     trailing_metadata = None
 
@@ -44,7 +54,6 @@ class Stream(StreamIterator):
         self._request = request
         self._send_type = send_type
         self._recv_type = recv_type
-        self._stream = None
 
     def _with_deadline(self):
         if self._request.deadline is not None:
@@ -60,11 +69,12 @@ class Stream(StreamIterator):
             raise ProtocolError('Request is already sent')
 
         protocol = await self._channel.__connect__()
-        # TODO: check concurrent streams count and maybe wait
-        self._stream = protocol.processor.create_stream()
-        headers_list = self._request.to_headers()
-
-        await self._stream.send_headers(headers_list)
+        stream = protocol.processor.connection.create_stream()
+        release_stream = await stream.send_request(
+            self._request.to_headers(), _processor=protocol.processor,
+        )
+        self._stream = stream
+        self._release_stream = release_stream
         self._send_request_done = True
 
     async def send_message(self, message, *, end=False):
@@ -157,17 +167,21 @@ class Stream(StreamIterator):
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if (
-            self._recv_trailing_metadata_done
-            or self._cancel_done
-            or self._stream is None
-        ):
-            return
+        try:
+            if (
+                self._recv_trailing_metadata_done
+                or self._cancel_done
+                or not self._send_request_done
+            ):
+                return
 
-        if exc_type or exc_val or exc_tb:
-            await self.cancel()
-        else:
-            await self.recv_trailing_metadata()
+            if exc_type or exc_val or exc_tb:
+                await self.cancel()
+            else:
+                await self.recv_trailing_metadata()
+        finally:
+            if self._release_stream is not None:
+                self._release_stream()
 
 
 class Channel:
@@ -210,7 +224,8 @@ class Channel:
         return Stream(self, request, request_type, reply_type)
 
     def close(self):
-        self._protocol.processor.close()
+        if self._protocol is not None:
+            self._protocol.processor.close()
 
 
 class ServiceMethod:
@@ -240,7 +255,7 @@ class UnaryStreamMethod(ServiceMethod):
     async def __call__(self, message, *, timeout=None, metadata=None):
         async with self.open(timeout=timeout, metadata=metadata) as stream:
             await stream.send_message(message, end=True)
-            return [message async for message in stream]
+            return await _to_list(stream)
 
 
 class StreamUnaryMethod(ServiceMethod):
@@ -266,4 +281,4 @@ class StreamStreamMethod(ServiceMethod):
                 await stream.send_message(messages[-1], end=True)
             else:
                 await stream.end()
-            return [message async for message in stream]
+            return await _to_list(stream)
